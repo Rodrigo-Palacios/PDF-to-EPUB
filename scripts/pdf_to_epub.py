@@ -11,7 +11,6 @@ import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from xml.etree import ElementTree as ET
 
 import fitz
 
@@ -25,68 +24,251 @@ CONTAINER_XML = """<?xml version="1.0" encoding="UTF-8"?>
 CSS = """body { font-family: serif; line-height: 1.55; margin: 5%; }
 h1 { page-break-before: always; font-size: 1.25em; }
 p { margin: 0 0 0.8em; text-indent: 1em; }
+.cover { margin: 0; padding: 0; text-align: center; }
+.cover img { display: block; height: 100vh; max-width: 100%; object-fit: contain; margin: 0 auto; }
 """
 
 
-def paragraphs_from_page(text: str) -> list[str]:
-    """Split extracted page text into readable paragraphs."""
-    result: list[str] = []
-    for block in re.split(r"\n\s*\n", text.strip()):
-        lines = [re.sub(r"\s+", " ", line).strip() for line in block.splitlines()]
-        paragraph = " ".join(line for line in lines if line)
-        if paragraph:
-            result.append(paragraph)
-    return result
+def clean_text(value: str) -> str:
+    return re.sub(r"[\u200b\u200c\u200d\ufeff]", "", value).strip()
 
 
-def xhtml_page(title: str, paragraphs: list[str]) -> bytes:
-    body = "\n".join(f"<p>{html.escape(p)}</p>" for p in paragraphs)
+def normalized(value: str) -> str:
+    return re.sub(r"\s+", " ", clean_text(value)).casefold().strip()
+
+
+def make_page_files(page_count: int) -> dict[int, str]:
+    return {index: ("cover.xhtml" if index == 0 else f"page-{index + 1:04}.xhtml") for index in range(page_count)}
+
+
+def outline_entries(pdf: fitz.Document, page_files: dict[int, str]) -> tuple[list[dict], dict[int, str]]:
+    entries: list[dict] = []
+    titles_by_page: dict[int, str] = {}
+    for level, raw_title, page_number, details in pdf.get_toc(simple=False):
+        title = clean_text(raw_title)
+        target_page = page_number - 1
+        if not title or target_page <= 0 or target_page not in page_files:
+            continue
+        point = details.get("to")
+        target_y = point.y if isinstance(point, fitz.Point) and point.y >= 0 else None
+        entries.append({
+            "level": max(1, level),
+            "title": title,
+            "page": target_page,
+            "y": target_y,
+            "anchor": f"chapter-{len(entries) + 1}",
+        })
+        titles_by_page.setdefault(target_page, title)
+
+    if not entries:
+        entries = [
+            {"level": 1, "title": f"Página {index + 1}", "page": index, "y": None, "anchor": f"chapter-{index + 1}"}
+            for index in range(1, len(page_files))
+        ]
+    return entries, titles_by_page
+
+
+def toc_tree(entries: list[dict]) -> list[dict]:
+    roots: list[dict] = []
+    stack: list[tuple[int, list[dict]]] = [(0, roots)]
+    for entry in entries:
+        level = max(1, entry["level"])
+        while len(stack) > 1 and stack[-1][0] >= level:
+            stack.pop()
+        if level > stack[-1][0] + 1:
+            level = stack[-1][0] + 1
+        node = {**entry, "children": []}
+        stack[-1][1].append(node)
+        stack.append((level, node["children"]))
+    return roots
+
+
+def render_toc(nodes: list[dict], page_files: dict[int, str]) -> str:
+    items = []
+    for node in nodes:
+        href = html.escape(f'{page_files[node["page"]]}#{node["anchor"]}', quote=True)
+        title = html.escape(node["title"])
+        children = f"<ol>{render_toc(node['children'], page_files)}</ol>" if node["children"] else ""
+        items.append(f'<li><a href="{href}">{title}</a>{children}</li>')
+    return "".join(items)
+
+
+def cover_xhtml(title: str) -> bytes:
     document = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE html>\n<html xmlns="http://www.w3.org/1999/xhtml" '
         'xmlns:epub="http://www.idpf.org/2007/ops" lang="es">\n'
         f"<head><title>{html.escape(title)}</title><link rel=\"stylesheet\" "
         'type="text/css" href="styles.css"/></head>\n'
-        f"<body><h1>{html.escape(title)}</h1>{body}</body>\n</html>"
+        f'<body epub:type="cover" class="cover"><img src="cover.png" alt="{html.escape(title, quote=True)}"/></body>\n'
+        '</html>'
     )
     return document.encode("utf-8")
 
 
-def convert_pdf(source: Path, destination: Path) -> int:
-    """Convert a text-based PDF and return its number of pages."""
+def xhtml_page(title: str, paragraphs: list[str], heading_ids: list[str] | None = None) -> bytes:
+    body = "\n".join(f"<p>{paragraph}</p>" for paragraph in paragraphs)
+    ids = "".join(f'<span id="{html.escape(anchor, quote=True)}"></span>' for anchor in heading_ids or [])
+    document = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE html>\n<html xmlns="http://www.w3.org/1999/xhtml" '
+        'xmlns:epub="http://www.idpf.org/2007/ops" lang="es">\n'
+        f"<head><title>{html.escape(title)}</title><link rel=\"stylesheet\" "
+        'type="text/css" href="styles.css"/></head>\n'
+        f"<body><h1>{ids}{html.escape(title)}</h1>{body}</body>\n</html>"
+    )
+    return document.encode("utf-8")
+
+
+def link_href(
+    link: dict,
+    line_text: str,
+    source_page: int,
+    page_files: dict[int, str],
+    toc_entries: list[dict],
+) -> str | None:
+    uri = link.get("uri", "")
+    if uri.startswith(("https://", "http://", "mailto:")):
+        return uri
+
+    target = link.get("page", -1)
+    visible = normalized(line_text)
+    matching_entry = next(
+        (
+            entry for entry in toc_entries
+            if normalized(entry["title"]) and normalized(entry["title"]) in visible
+        ),
+        None,
+    )
+    if matching_entry:
+        target = matching_entry["page"]
+    if target <= 0 or target not in page_files:
+        return None
+    target_entry = matching_entry or next((entry for entry in toc_entries if entry["page"] == target), None)
+    suffix = f'#{target_entry["anchor"]}' if target_entry else ""
+    if target in page_files:
+        return f"{page_files[target]}{suffix}"
+    return None
+
+
+def page_paragraphs(
+    page: fitz.Page,
+    page_number: int,
+    page_files: dict[int, str],
+    toc_entries: list[dict],
+) -> tuple[list[str], list[str]]:
+    paragraphs: list[str] = []
+    blocks = page.get_text("dict", sort=True).get("blocks", [])
+    text_lines: dict[tuple[int, int], str] = {}
+    line_rects: dict[tuple[int, int], fitz.Rect] = {}
+    for block_index, block in enumerate(blocks):
+        for line_index, line in enumerate(block.get("lines", [])):
+            key = (block_index, line_index)
+            text_lines[key] = clean_text("".join(span.get("text", "") for span in line["spans"]))
+            line_rects[key] = fitz.Rect(line["bbox"])
+
+    chapter_ids_by_line: dict[tuple[int, int], list[str]] = {}
+    heading_ids: list[str] = []
+    line_keys = [key for key in line_rects if text_lines[key]]
+    for entry in toc_entries:
+        if entry["page"] != page_number:
+            continue
+        if not line_keys:
+            heading_ids.append(entry["anchor"])
+            continue
+        target_y = entry.get("y")
+        if target_y is None:
+            heading_ids.append(entry["anchor"])
+            continue
+        nearest = min(line_keys, key=lambda key: abs(line_rects[key].y0 - target_y))
+        chapter_ids_by_line.setdefault(nearest, []).append(entry["anchor"])
+
+    # Resolve a link against all text in its rectangle so split title/page-number
+    # spans remain one clickable table-of-contents entry.
+    linked_lines: dict[tuple[int, int], tuple[int, str, str]] = {}
+    for link_index, link in enumerate(page.get_links()):
+        rect = fitz.Rect(link.get("from", (0, 0, 0, 0)))
+        keys = [key for key, line_rect in line_rects.items() if text_lines[key] and rect.intersects(line_rect)]
+        if not keys:
+            continue
+        visible_text = " ".join(text_lines[key] for key in keys)
+        href = link_href(link, visible_text, page_number, page_files, toc_entries)
+        if not href:
+            continue
+        group_text = " ".join(text_lines[key] for key in keys)
+        for key in keys:
+            linked_lines.setdefault(key, (link_index, href, group_text))
+
+    emitted_links: set[int] = set()
+    for block_index, block in enumerate(blocks):
+        if "lines" not in block:
+            continue
+        lines: list[str] = []
+        for line_index, _line in enumerate(block["lines"]):
+            key = (block_index, line_index)
+            text = text_lines[key]
+            if not text:
+                continue
+            linked = linked_lines.get(key)
+            if linked:
+                link_index, href, group_text = linked
+                if link_index in emitted_links:
+                    continue
+                emitted_links.add(link_index)
+                group_ids = []
+                for group_key, candidate in linked_lines.items():
+                    if candidate[0] == link_index:
+                        group_ids.extend(chapter_ids_by_line.get(group_key, []))
+                prefix = "".join(f'<span id="{html.escape(anchor, quote=True)}"></span>' for anchor in dict.fromkeys(group_ids))
+                lines.append(f'{prefix}<a href="{html.escape(href, quote=True)}">{html.escape(group_text)}</a>')
+            else:
+                prefix = "".join(
+                    f'<span id="{html.escape(anchor, quote=True)}"></span>'
+                    for anchor in chapter_ids_by_line.get(key, [])
+                )
+                lines.append(f"{prefix}{html.escape(text)}")
+        if lines:
+            paragraphs.append(" ".join(lines))
+    return paragraphs, heading_ids
+
+
+def convert_pdf(source: Path, destination: Path) -> tuple[int, int]:
+    """Convert a PDF, preserving its first-page cover, outline, and internal links."""
     with fitz.open(source) as pdf:
         if pdf.needs_pass:
             raise ValueError("el PDF está protegido con contraseña")
         if pdf.page_count == 0:
             raise ValueError("el PDF no contiene páginas")
 
-        title = (pdf.metadata or {}).get("title", "").strip() or source.stem
-        pages: list[tuple[str, bytes]] = []
-        for index, page in enumerate(pdf, start=1):
-            paragraphs = paragraphs_from_page(page.get_text("text", sort=True))
-            if paragraphs:
-                page_title = f"{title} — página {index}"
-                pages.append((f"page-{index:04}.xhtml", xhtml_page(page_title, paragraphs)))
-        if not pages:
-            raise ValueError("no se encontró texto; puede ser un PDF escaneado que necesite OCR")
+        title = clean_text((pdf.metadata or {}).get("title", "")) or source.stem
+        page_files = make_page_files(pdf.page_count)
+        toc_entries, titles_by_page = outline_entries(pdf, page_files)
+        cover = pdf[0].get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False).tobytes("png")
+        page_documents: list[tuple[str, bytes]] = []
+        preserved_link_count = 0
+        for index in range(1, pdf.page_count):
+            page = pdf[index]
+            page_title = titles_by_page.get(index, f"{title} — página {index + 1}")
+            paragraphs, heading_ids = page_paragraphs(page, index, page_files, toc_entries)
+            for paragraph in paragraphs:
+                preserved_link_count += paragraph.count("<a href=")
+            page_documents.append((page_files[index], xhtml_page(page_title, paragraphs, heading_ids)))
 
         book_id = f"urn:uuid:{uuid.uuid4()}"
         modified = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         manifest_items = [
             '<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>',
             '<item id="css" href="styles.css" media-type="text/css"/>',
+            '<item id="cover-page" href="cover.xhtml" media-type="application/xhtml+xml"/>',
+            '<item id="cover-image" href="cover.png" media-type="image/png" properties="cover-image"/>',
         ]
-        spine_items = []
-        nav_items = []
-        for index, (filename, _) in enumerate(pages, start=1):
+        spine_items = ['<itemref idref="cover-page"/>']
+        for index, (filename, _) in enumerate(page_documents, start=2):
             page_id = f"page{index}"
             manifest_items.append(
                 f'<item id="{page_id}" href="{filename}" media-type="application/xhtml+xml"/>'
             )
             spine_items.append(f'<itemref idref="{page_id}"/>')
-            nav_items.append(
-                f'<li><a href="{filename}">Página {index}</a></li>'
-            )
 
         package = (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -99,12 +281,13 @@ def convert_pdf(source: Path, destination: Path) -> int:
             f"<manifest>{''.join(manifest_items)}</manifest>\n"
             f"<spine>{''.join(spine_items)}</spine></package>"
         ).encode("utf-8")
+        toc_html = render_toc(toc_tree(toc_entries), page_files)
         nav = (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             '<!DOCTYPE html>\n<html xmlns="http://www.w3.org/1999/xhtml" '
             'xmlns:epub="http://www.idpf.org/2007/ops" lang="es">'
             f"<head><title>{html.escape(title)}</title></head>"
-            f'<body><nav epub:type="toc"><h1>Contenido</h1><ol>{"".join(nav_items)}</ol>'
+            f'<body><nav epub:type="toc"><h1>Contenido</h1><ol>{toc_html}</ol>'
             "</nav></body></html>"
         ).encode("utf-8")
 
@@ -115,9 +298,11 @@ def convert_pdf(source: Path, destination: Path) -> int:
         epub.writestr("EPUB/package.opf", package)
         epub.writestr("EPUB/nav.xhtml", nav)
         epub.writestr("EPUB/styles.css", CSS)
-        for filename, content in pages:
+        epub.writestr("EPUB/cover.xhtml", cover_xhtml(title))
+        epub.writestr("EPUB/cover.png", cover)
+        for filename, content in page_documents:
             epub.writestr(f"EPUB/{filename}", content)
-    return len(pages)
+    return len(page_documents) + 1, preserved_link_count
 
 
 def parse_args() -> argparse.Namespace:
@@ -158,9 +343,9 @@ def main() -> int:
     failed = 0
     for source, destination in sources:
         try:
-            pages = convert_pdf(source, destination)
-            print(f"OK {source} -> {destination} ({pages} páginas con texto)")
-        except (OSError, ValueError, RuntimeError, ET.ParseError) as exc:
+            pages, links = convert_pdf(source, destination)
+            print(f"OK {source} -> {destination} ({pages} páginas; {links} enlaces conservados)")
+        except (OSError, ValueError, RuntimeError) as exc:
             failed += 1
             print(f"ERROR {source}: {exc}", file=sys.stderr)
     print(f"Conversión: {len(sources) - failed}/{len(sources)} PDF procesados.")

@@ -26,7 +26,7 @@ To convert one file directly, without prompting:
 .venv/bin/python scripts/pdf_to_epub.py --input path/to/book.pdf --output output/book.epub
 ```
 
-Use `--input-dir` and `--output-dir` to change the batch locations. Use `--help` for all options. The EPUB contains extracted selectable text, split by PDF page. Image-only or password-protected PDFs need preprocessing before conversion.
+Use `--input-dir` and `--output-dir` to change the batch locations. Use `--help` for all options. The EPUB includes the first PDF page as its cover, carries over PDF bookmarks into its linked table of contents, and preserves detectable links on PDF pages. Text is split by page. Image-only or password-protected PDFs need preprocessing before conversion.
 
 ## Results
 
