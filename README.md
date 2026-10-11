@@ -42,9 +42,10 @@ El conversor busca PDF recursivamente. Guarda cada EPUB en `output/` y conserva 
 - La primera página del PDF como portada del EPUB.
 - Los marcadores del PDF como una tabla de contenido navegable, con enlaces a los capítulos.
 - Los enlaces detectables dentro de las páginas, incluidos los del índice original.
+- Las tablas con bordes detectables como tablas EPUB con filas y columnas.
 - El texto seleccionable, organizado por página.
 
-Los PDF escaneados sin capa de texto necesitan OCR antes de convertirlos. Los PDF protegidos con contraseña no se procesan. Las imágenes interiores no se incorporan actualmente; la portada sí se conserva.
+Los PDF escaneados sin capa de texto necesitan OCR antes de convertirlos. Los PDF protegidos con contraseña no se procesan. La detección automática de tablas se basa en sus bordes visibles; tablas sin bordes pueden requerir ajustes. Las imágenes interiores no se incorporan actualmente; la portada sí se conserva.
 
 ## Estructura del proyecto
 

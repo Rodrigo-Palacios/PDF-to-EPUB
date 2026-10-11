@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import argparse
 import html
+import io
 import re
 import sys
 import uuid
 import zipfile
+from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,6 +26,9 @@ CONTAINER_XML = """<?xml version="1.0" encoding="UTF-8"?>
 CSS = """body { font-family: serif; line-height: 1.55; margin: 5%; }
 h1 { page-break-before: always; font-size: 1.25em; }
 p { margin: 0 0 0.8em; text-indent: 1em; }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; page-break-inside: avoid; }
+th, td { border: 1px solid #777; padding: 0.35em; text-align: left; vertical-align: top; }
+th { background: #eee; }
 .cover { margin: 0; padding: 0; text-align: center; }
 .cover img { display: block; height: 100vh; max-width: 100%; object-fit: contain; margin: 0 auto; }
 """
@@ -107,7 +112,7 @@ def cover_xhtml(title: str) -> bytes:
 
 
 def xhtml_page(title: str, paragraphs: list[str], heading_ids: list[str] | None = None) -> bytes:
-    body = "\n".join(f"<p>{paragraph}</p>" for paragraph in paragraphs)
+    body = "\n".join(paragraphs)
     ids = "".join(f'<span id="{html.escape(anchor, quote=True)}"></span>' for anchor in heading_ids or [])
     document = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -118,6 +123,32 @@ def xhtml_page(title: str, paragraphs: list[str], heading_ids: list[str] | None 
         f"<body><h1>{ids}{html.escape(title)}</h1>{body}</body>\n</html>"
     )
     return document.encode("utf-8")
+
+
+def table_html(table: fitz.table.Table) -> str:
+    rows = table.extract()
+    header = table.header
+    names = [clean_text(name or "") for name in (header.names or [])]
+    has_header = len(names) == table.col_count and any(names)
+    if has_header and not header.external and rows:
+        rows = rows[1:]
+
+    def cell(value: str | None) -> str:
+        return html.escape(clean_text(value or "")).replace("\n", "<br />")
+
+    head = ""
+    if has_header:
+        head = "<thead><tr>" + "".join(f'<th scope="col">{cell(name)}</th>' for name in names) + "</tr></thead>"
+
+    body_rows = []
+    for row in rows:
+        values = [cell(value) for value in row]
+        populated = [value for value in values if value]
+        if len(populated) == 1 and len(values) > 1:
+            body_rows.append(f'<tr><th scope="rowgroup" colspan="{len(values)}">{populated[0]}</th></tr>')
+        else:
+            body_rows.append("<tr>" + "".join(f"<td>{value}</td>" for value in values) + "</tr>")
+    return f'<table class="pdf-table">{head}<tbody>{"".join(body_rows)}</tbody></table>'
 
 
 def link_href(
@@ -156,9 +187,12 @@ def page_paragraphs(
     page_number: int,
     page_files: dict[int, str],
     toc_entries: list[dict],
-) -> tuple[list[str], list[str]]:
-    paragraphs: list[str] = []
+) -> tuple[list[str], list[str], int]:
+    content_blocks: list[tuple[float, str]] = []
     blocks = page.get_text("dict", sort=True).get("blocks", [])
+    with redirect_stdout(io.StringIO()):
+        tables = page.find_tables(strategy="lines").tables
+    table_regions = [fitz.Rect(table.bbox) for table in tables]
     text_lines: dict[tuple[int, int], str] = {}
     line_rects: dict[tuple[int, int], fitz.Rect] = {}
     for block_index, block in enumerate(blocks):
@@ -169,7 +203,10 @@ def page_paragraphs(
 
     chapter_ids_by_line: dict[tuple[int, int], list[str]] = {}
     heading_ids: list[str] = []
-    line_keys = [key for key in line_rects if text_lines[key]]
+    line_keys = [
+        key for key, rect in line_rects.items()
+        if text_lines[key] and not any(region.contains(fitz.Point((rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2)) for region in table_regions)
+    ]
     for entry in toc_entries:
         if entry["page"] != page_number:
             continue
@@ -209,6 +246,9 @@ def page_paragraphs(
             text = text_lines[key]
             if not text:
                 continue
+            rect = line_rects[key]
+            if any(region.contains(fitz.Point((rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2)) for region in table_regions):
+                continue
             linked = linked_lines.get(key)
             if linked:
                 link_index, href, group_text = linked
@@ -228,11 +268,15 @@ def page_paragraphs(
                 )
                 lines.append(f"{prefix}{html.escape(text)}")
         if lines:
-            paragraphs.append(" ".join(lines))
-    return paragraphs, heading_ids
+            content_blocks.append((float(block["bbox"][1]), f'<p>{" ".join(lines)}</p>'))
+
+    for table in tables:
+        content_blocks.append((float(table.bbox[1]), table_html(table)))
+    content_blocks.sort(key=lambda item: item[0])
+    return [content for _, content in content_blocks], heading_ids, len(tables)
 
 
-def convert_pdf(source: Path, destination: Path) -> tuple[int, int]:
+def convert_pdf(source: Path, destination: Path) -> tuple[int, int, int]:
     """Convert a PDF, preserving its first-page cover, outline, and internal links."""
     with fitz.open(source) as pdf:
         if pdf.needs_pass:
@@ -246,10 +290,12 @@ def convert_pdf(source: Path, destination: Path) -> tuple[int, int]:
         cover = pdf[0].get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False).tobytes("png")
         page_documents: list[tuple[str, bytes]] = []
         preserved_link_count = 0
+        preserved_table_count = 0
         for index in range(1, pdf.page_count):
             page = pdf[index]
             page_title = titles_by_page.get(index, f"{title} — página {index + 1}")
-            paragraphs, heading_ids = page_paragraphs(page, index, page_files, toc_entries)
+            paragraphs, heading_ids, table_count = page_paragraphs(page, index, page_files, toc_entries)
+            preserved_table_count += table_count
             for paragraph in paragraphs:
                 preserved_link_count += paragraph.count("<a href=")
             page_documents.append((page_files[index], xhtml_page(page_title, paragraphs, heading_ids)))
@@ -302,7 +348,7 @@ def convert_pdf(source: Path, destination: Path) -> tuple[int, int]:
         epub.writestr("EPUB/cover.png", cover)
         for filename, content in page_documents:
             epub.writestr(f"EPUB/{filename}", content)
-    return len(page_documents) + 1, preserved_link_count
+    return len(page_documents) + 1, preserved_link_count, preserved_table_count
 
 
 def parse_args() -> argparse.Namespace:
@@ -343,8 +389,8 @@ def main() -> int:
     failed = 0
     for source, destination in sources:
         try:
-            pages, links = convert_pdf(source, destination)
-            print(f"OK {source} -> {destination} ({pages} páginas; {links} enlaces conservados)")
+            pages, links, tables = convert_pdf(source, destination)
+            print(f"OK {source} -> {destination} ({pages} páginas; {links} enlaces y {tables} tablas conservados)")
         except (OSError, ValueError, RuntimeError) as exc:
             failed += 1
             print(f"ERROR {source}: {exc}", file=sys.stderr)
